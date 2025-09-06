@@ -33,9 +33,22 @@ A Discord bot that verifies Cardano wallet ownership and automatically assigns r
 3\. Create `.env` file with your Discord token
 
 4\. Create desired Discord roles
-5. Configure roles and policy IDs via `/setupverify`
+
+5\. Configure roles and policy IDs via `/setupverify`
 
 6\. Run with `npm start` or deploy with Docker
+
+
+
+\## Use
+
+
+
+1\. Verify asset via `/verify`
+
+2\. Input wallet address
+
+3\. Send exact amount of crypto prompted to verifying address
 
 
 
@@ -48,10 +61,4 @@ A Discord bot that verifies Cardano wallet ownership and automatically assigns r
 docker build -t cardano-wallet-bot .
 
 docker run -d --name cardano-wallet-bot-1 cardano-wallet-bot
-
-## Use
-
-1. Verify asset via `/verify`
-2. Input wallet address
-3. Send exact amount of crypto prompted to verifying address
 
