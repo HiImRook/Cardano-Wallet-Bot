@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js')
 const fetch = require('node-fetch')
+const { chromium } = require('playwright')
 require('dotenv').config()
 
 const client = new Client({
@@ -16,6 +17,7 @@ const pendingSetups = new Map()
 
 const RATE_LIMIT_WINDOW = 5 * 60 * 1000
 const VERIFICATION_TIMEOUT = 10 * 60 * 1000
+const VERIFICATION_DELAY = 5 * 60 * 1000
 const POOL_SCRAPE_INTERVAL = 30 * 60 * 1000
 const BACKUP_INTERVAL = 4 * 60 * 60 * 1000
 const CARDANO_SCAN_INTERVAL = 30 * 1000
@@ -57,30 +59,112 @@ function getRarityRole(count, config) {
   return null
 }
 
-async function scrapeCardanoScan(address) {
+async function scrapeCardanoScan(address, expectedAmount) {
+  let browser
   try {
     console.log(`Scraping CardanoScan for address: ${address}`)
-    const url = `https://cardanoscan.io/address/${address}`
-    const response = await fetch(url)
-    const html = await response.text()
     
-    console.log(`CardanoScan response length: ${html.length}`)
+    browser = await chromium.launch({
+      headless: true,
+      executablePath: '/usr/bin/chromium-browser',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    })
     
-    const selfTxPattern = new RegExp(`${address}.*?${address}.*?(\\d+\\.\\d{4})\\s*₳`, 'g')
-    const matches = Array.from(html.matchAll(selfTxPattern))
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    })
     
-    console.log(`Found ${matches.length} potential self-transactions`)
+    const page = await context.newPage()
     
-    for (const match of matches) {
-      const amount = parseFloat(match[1])
-      console.log(`Found transaction amount: ${amount}`)
-      return amount
+    const addressUrl = `https://cardanoscan.io/address/${address}`
+    await page.goto(addressUrl, { waitUntil: 'domcontentloaded' })
+    
+    await page.waitForTimeout(3000)
+    
+    const transactionHashes = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a[href*="/transaction/"]'))
+      return links.map(link => {
+        const href = link.getAttribute('href')
+        const match = href.match(/\/transaction\/([a-f0-9]{64})/)
+        return match ? match[1] : null
+      }).filter(hash => hash !== null)
+    })
+    
+    console.log(`Found ${transactionHashes.length} transaction hashes`)
+    
+    if (transactionHashes.length === 0) {
+      console.log('No transaction hashes found in DOM')
+      return null
+    }
+    
+    const latestTxHash = transactionHashes[0]
+    console.log(`Latest transaction hash: ${latestTxHash}`)
+    
+    const utxoUrl = `https://cardanoscan.io/transaction/${latestTxHash}?tab=utxo`
+    console.log(`Checking UTXO page: ${utxoUrl}`)
+    
+    await page.goto(utxoUrl, { waitUntil: 'domcontentloaded' })
+    await page.waitForTimeout(2000)
+    
+    const foundAmount = await page.evaluate((targetAddress, targetAmount) => {
+      const outputRows = document.querySelectorAll('div:has-text("To Addresses (Outputs)") ~ * tr, [data-testid*="output"] tr, .output-row tr')
+      
+      for (const row of outputRows) {
+        const addressCell = row.querySelector('td, div')
+        if (addressCell && addressCell.textContent.includes(targetAddress)) {
+          const amountText = row.textContent
+          const amountMatch = amountText.match(/([\d,]+\.?\d*)\s*₳/)
+          if (amountMatch) {
+            const amount = parseFloat(amountMatch[1].replace(/,/g, ''))
+            if (Math.abs(amount - targetAmount) < 0.0001) {
+              return amount
+            }
+          }
+        }
+      }
+      
+      const allText = document.body.innerText
+      const lines = allText.split('\n')
+      let inOutputSection = false
+      
+      for (const line of lines) {
+        if (line.includes('To Addresses (Outputs)')) {
+          inOutputSection = true
+          continue
+        }
+        if (line.includes('Total Output') || line.includes('Fees')) {
+          inOutputSection = false
+          continue
+        }
+        
+        if (inOutputSection && line.includes(targetAddress)) {
+          const amountMatch = line.match(/([\d,]+\.?\d*)\s*₳/)
+          if (amountMatch) {
+            const amount = parseFloat(amountMatch[1].replace(/,/g, ''))
+            if (Math.abs(amount - targetAmount) < 0.0001) {
+              return amount
+            }
+          }
+        }
+      }
+      
+      return null
+    }, address, expectedAmount)
+    
+    if (foundAmount !== null) {
+      console.log(`Verification amount ${expectedAmount} found!`)
+      return foundAmount
     }
     
     return null
+    
   } catch (error) {
     console.error('CardanoScan scrape error:', error)
     return null
+  } finally {
+    if (browser) {
+      await browser.close()
+    }
   }
 }
 
@@ -88,7 +172,16 @@ async function scrapePoolPm(address) {
   try {
     console.log(`Scraping Pool.pm for address: ${address}`)
     const url = `https://pool.pm/${address}`
-    const response = await fetch(url)
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+      }
+    })
     const html = await response.text()
     
     console.log(`Pool.pm response length: ${html.length}`)
@@ -124,9 +217,14 @@ async function processVerifications() {
       continue
     }
     
+    if (now - verification.timestamp < VERIFICATION_DELAY) {
+      console.log(`Waiting for verification delay for user ${userId}`)
+      continue
+    }
+    
     try {
       console.log(`Checking verification for user ${userId}, looking for amount ${verification.amount}`)
-      const detectedAmount = await scrapeCardanoScan(verification.address)
+      const detectedAmount = await scrapeCardanoScan(verification.address, verification.amount)
       console.log(`Detected amount: ${detectedAmount}`)
       
       if (detectedAmount === verification.amount) {
